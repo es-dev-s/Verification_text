@@ -1,0 +1,27 @@
+# Text extraction only (no Gemini). Gemini keys live on the Verification Engine API.
+services:
+  titlextractor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: titlextractor:latest
+    ports:
+      - "5000:5000"
+    environment:
+      PORT: "5000"
+      WEB_CONCURRENCY: "${WEB_CONCURRENCY:-2}"
+      GUNICORN_TIMEOUT: "180"
+      TESSERACT_CMD: /usr/bin/tesseract
+    restart: unless-stopped
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import os,urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/health'%os.environ.get('PORT','5000'), timeout=3)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
