@@ -5,7 +5,7 @@ import os
 port = os.environ.get("PORT", "5000").strip() or "5000"
 bind = [f"0.0.0.0:{port}"]
 workers = int(os.environ.get("WEB_CONCURRENCY", "2"))
-timeout = int(os.environ.get("GUNICORN_TIMEOUT", "180"))
+timeout = int(os.environ.get("GUNICORN_TIMEOUT", "360"))
 graceful_timeout = 30
 forwarded_allow_ips = "*"
 accesslog = "-"

@@ -20,7 +20,7 @@ from extractor.pdf_utils import (
     spans_to_lines,
 )
 
-OCR_TIMEOUT_SEC = 45.0
+OCR_TIMEOUT_SEC = 120.0
 
 
 def extract_full_document(

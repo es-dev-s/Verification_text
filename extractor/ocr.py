@@ -1,8 +1,8 @@
 """
 Tesseract OCR fallback for scanned / garbled PDF pages.
 
-Title extraction OCRs a full page at modest DPI in grayscale so Tesseract
-stays fast without clipping a cover title that sits mid-page.
+Renders pages at high DPI and keeps a large max width so dense multi-page
+transcript tables (subject names, not just codes) remain readable.
 """
 
 from __future__ import annotations
@@ -17,12 +17,12 @@ pytesseract = None
 Output = None
 Image = None
 
-DEFAULT_DPI = 180
+DEFAULT_DPI = 400
 TITLE_BAND = 1.0
-MAX_OCR_WIDTH = 1400
+MAX_OCR_WIDTH = 3200
 PSM_NO_OSD = "3"
 TESSERACT_OEM = "1"
-OCR_TIMEOUT_SEC = 45
+OCR_TIMEOUT_SEC = 120
 _TESSERACT_CMD: str | None = None
 
 
@@ -102,7 +102,7 @@ def ocr_page(
     timeout: float = OCR_TIMEOUT_SEC,
     band: float = TITLE_BAND,
 ) -> list[dict[str, Any]]:
-    """OCR one page (full page, modest DPI) and return native-shaped spans."""
+    """OCR one page (full page, high DPI) and return native-shaped spans."""
     _ensure_tesseract()
 
     rect = page.rect
