@@ -11,7 +11,8 @@ services:
       PORT: "5000"
       WEB_CONCURRENCY: "${WEB_CONCURRENCY:-2}"
       GUNICORN_TIMEOUT: "180"
-      TESSERACT_CMD: /usr/bin/tesseract
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+      PADDLEOCR_LANG: en
     restart: unless-stopped
     healthcheck:
       test:

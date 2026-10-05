@@ -1,7 +1,7 @@
 """
 Full-document PDF text extraction for CV parsing.
 
-Reuses native PyMuPDF extraction and Tesseract OCR from this package.
+Reuses native PyMuPDF extraction and PaddleOCR from this package.
 Unlike title extraction, every uploaded page is processed — no front-matter
 cap and no OCR page budget.
 """
@@ -51,7 +51,7 @@ def extract_full_document(
             spans.extend(page_spans)
             pages.append(report)
 
-        lines = spans_to_lines(spans)
+        lines = _spans_to_document_lines(spans)
         for line in lines:
             width, height = page_geom.get(line["page"], (612.0, 792.0))
             line["page_width"] = round(width, 2)
@@ -75,6 +75,41 @@ def extract_full_document(
         }
     finally:
         doc.close()
+
+
+def _spans_to_document_lines(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep PaddleOCR visual lines intact; only re-cluster native PDF spans."""
+    if spans and all(span.get("source") == "ocr" for span in spans):
+        ordered = sorted(
+            spans,
+            key=lambda item: (
+                int(item.get("page") or 0),
+                float(item["bbox"][1]),
+                float(item["bbox"][0]),
+            ),
+        )
+        lines: list[dict[str, Any]] = []
+        for index, span in enumerate(ordered):
+            text = (span.get("text") or "").strip()
+            if not text:
+                continue
+            lines.append(
+                {
+                    "text": text,
+                    "page": int(span.get("page") or 1),
+                    "font_name": span.get("font_name") or "ocr",
+                    "font_size": float(span.get("font_size") or 0.0),
+                    "bold": bool(span.get("bold")),
+                    "italic": bool(span.get("italic")),
+                    "bbox": list(span.get("bbox") or [0, 0, 0, 0]),
+                    "block": span.get("block", 0),
+                    "line": span.get("line", index),
+                    "source": "ocr",
+                    "span_count": 1,
+                }
+            )
+        return lines
+    return spans_to_lines(spans)
 
 
 def _extract_one_page(

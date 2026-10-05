@@ -331,7 +331,7 @@ def _same_visual_line(span: dict[str, Any], cluster: list[dict[str, Any]]) -> bo
 
 
 def _merge_ocr_baseline_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Join OCR title halves that sit on one baseline with a gap Tesseract treated as two lines."""
+    """Join OCR title halves that sit on one baseline with a gap OCR treated as two lines."""
     if len(lines) < 2:
         return lines
     ordered = sorted(lines, key=lambda item: (item["page"], item["bbox"][1], item["bbox"][0]))

@@ -17,7 +17,7 @@ The Verification Engine API workers call this service, then Node runs Gemini par
 pip install -r requirements.txt
 ```
 
-Tesseract must be on `PATH` for OCR (images / scanned PDFs / DOCX images).
+OCR uses **PaddleOCR** (installed via `requirements.txt`). First run downloads model weights; set `PADDLEOCR_LANG` (default `en`) if needed.
 
 ## Run
 
