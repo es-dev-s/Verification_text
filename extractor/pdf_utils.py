@@ -202,16 +202,7 @@ def spans_to_lines(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
         by_page.setdefault(int(span["page"]), []).append(span)
 
     for page_number, page_spans in by_page.items():
-        clusters: list[list[dict[str, Any]]] = []
-        for span in sorted(page_spans, key=lambda item: (item["bbox"][1], item["bbox"][0])):
-            placed = False
-            for cluster in clusters:
-                if _same_visual_line(span, cluster):
-                    cluster.append(span)
-                    placed = True
-                    break
-            if not placed:
-                clusters.append([span])
+        clusters = _cluster_page_spans(page_spans)
 
         for line_index, cluster in enumerate(clusters):
             line_spans = sorted(cluster, key=lambda item: (item["bbox"][0], item["bbox"][1]))
@@ -239,6 +230,47 @@ def spans_to_lines(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
     lines.sort(key=lambda item: (item["page"], item["bbox"][1], item["bbox"][0]))
     _mark_ocr_prominence(lines)
     return lines
+
+
+def _cluster_page_spans(page_spans: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """
+    Cluster spans into visual rows.
+
+    OCR spans already carry a rebuilt ``line`` id from the Tesseract pipeline
+    (center-Y gap assignment). Prefer that so dense transcript tables keep one
+    course per row; fall back to geometric clustering otherwise.
+    """
+    ocr_spans = [span for span in page_spans if span.get("source") == "ocr"]
+    other_spans = [span for span in page_spans if span.get("source") != "ocr"]
+
+    clusters: list[list[dict[str, Any]]] = []
+    if ocr_spans and all("line" in span for span in ocr_spans):
+        by_line: dict[int, list[dict[str, Any]]] = {}
+        for span in ocr_spans:
+            by_line.setdefault(int(span["line"]), []).append(span)
+        for line_id in sorted(by_line):
+            clusters.append(by_line[line_id])
+    else:
+        for span in sorted(ocr_spans, key=lambda item: (item["bbox"][1], item["bbox"][0])):
+            placed = False
+            for cluster in clusters:
+                if _same_visual_line(span, cluster):
+                    cluster.append(span)
+                    placed = True
+                    break
+            if not placed:
+                clusters.append([span])
+
+    for span in sorted(other_spans, key=lambda item: (item["bbox"][1], item["bbox"][0])):
+        placed = False
+        for cluster in clusters:
+            if _same_visual_line(span, cluster):
+                cluster.append(span)
+                placed = True
+                break
+        if not placed:
+            clusters.append([span])
+    return clusters
 
 
 def reconstruct_text(lines: list[dict[str, Any]]) -> str:
@@ -324,14 +356,16 @@ def _same_visual_line(span: dict[str, Any], cluster: list[dict[str, Any]]) -> bo
             return False
     ocr = span.get("source") == "ocr" or any(item.get("source") == "ocr" for item in cluster)
     page_width = max(cx1, sx1, 1.0)
-    gutter_limit = max(90.0, 0.16 * page_width) if ocr else 20.0
+    # Transcript tables often have wide empty gaps between cells; keep them on
+    # one visual line so column text is not split across separate rows.
+    gutter_limit = max(140.0, 0.42 * page_width) if ocr else 20.0
     if gutter > gutter_limit:
         return False
     return True
 
 
 def _merge_ocr_baseline_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Join OCR title halves that sit on one baseline with a gap Tesseract treated as two lines."""
+    """Join OCR title halves that sit on one baseline with a gap treated as two lines."""
     if len(lines) < 2:
         return lines
     ordered = sorted(lines, key=lambda item: (item["page"], item["bbox"][1], item["bbox"][0]))
@@ -348,6 +382,11 @@ def _ocr_split_title_pair(left: dict[str, Any], right: dict[str, Any]) -> bool:
     if int(left.get("page") or 0) != int(right.get("page") or 0):
         return False
     if left.get("source") != "ocr" and right.get("source") != "ocr":
+        return False
+    # Full-width transcript table rows share an x-origin; never stitch those.
+    left_w = left["bbox"][2] - left["bbox"][0]
+    right_w = right["bbox"][2] - right["bbox"][0]
+    if left_w > 120 and right_w > 120 and abs(left["bbox"][0] - right["bbox"][0]) < 40:
         return False
     ly0, ly1 = left["bbox"][1], left["bbox"][3]
     ry0, ry1 = right["bbox"][1], right["bbox"][3]
@@ -426,20 +465,45 @@ def _union_bbox(boxes: list[list[float]]) -> list[float]:
     ]
 
 
+_COURSE_CODE_RE = re.compile(
+    r"^(?:MATH|GSB|GSC|GSA|QM|CS|EE|BE|FE|RE|HE|BF|OM)\d{3,4}$",
+    re.I,
+)
+
+
 def _join_span_texts(spans: list[dict[str, Any]]) -> str:
+    """Join spans on one visual line; keep wide OCR gaps as column separators."""
     parts: list[str] = []
     previous_x1: float | None = None
+    previous_text = ""
+    ocr_line = any(span.get("source") == "ocr" for span in spans)
+    heights = [
+        max(float(span.get("font_size") or 0.0), span["bbox"][3] - span["bbox"][1])
+        for span in spans
+    ]
+    avg_h = (sum(heights) / len(heights)) if heights else 10.0
+    # Transcript table cells are often far apart horizontally.
+    column_gap = max(24.0, 1.8 * avg_h) if ocr_line else 1e9
+
     for span in spans:
         text = span["text"]
         x0, _, x1, _ = span["bbox"]
-        if (
-            previous_x1 is not None
-            and x0 - previous_x1 > 1.2
-            and parts
-            and not parts[-1].endswith(" ")
-            and not text.startswith(" ")
-        ):
-            parts.append(" ")
+        if parts and not parts[-1].endswith((" ", "|")) and not text.startswith(" "):
+            gap = 0.0 if previous_x1 is None else x0 - previous_x1
+            both_codes = _COURSE_CODE_RE.match(previous_text) and _COURSE_CODE_RE.match(
+                text
+            )
+            if both_codes:
+                # Never glue adjacent course codes even if boxes nearly touch.
+                parts.append(" | " if gap >= column_gap else " ")
+            elif previous_x1 is not None and gap > 1.2:
+                parts.append(" | " if gap >= column_gap else " ")
         parts.append(text)
         previous_x1 = x1
-    return re.sub(r"[ \t]+", " ", "".join(parts)).strip()
+        previous_text = text
+
+    joined = "".join(parts)
+    # Preserve explicit column markers; collapse ordinary whitespace only.
+    joined = re.sub(r"[ \t]+", " ", joined)
+    joined = re.sub(r"\s*\|\s*", " | ", joined)
+    return joined.strip()

@@ -10,8 +10,12 @@ services:
     environment:
       PORT: "5000"
       WEB_CONCURRENCY: "${WEB_CONCURRENCY:-2}"
-      GUNICORN_TIMEOUT: "180"
-      TESSERACT_CMD: /usr/bin/tesseract
+      GUNICORN_TIMEOUT: "900"
+      PADDLEOCR_TIMEOUT_SEC: "600"
+      PADDLEOCR_DPI: "300"
+      PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK: "True"
+      PADDLEOCR_ENABLE_MKLDNN: "True"
+      PADDLEOCR_LANG: en
     restart: unless-stopped
     healthcheck:
       test:
@@ -24,4 +28,5 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 20s
+      start_period: 60s
+

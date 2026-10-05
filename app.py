@@ -79,10 +79,23 @@ def extract_text():
 
     try:
         result = extract_text_file(temp_path, filename=original)
+        raw = result.get("raw_text") or ""
         _safe_print(
             f"[extract-text] {original} | method={result.get('method')} | "
-            f"chars={len(result.get('raw_text') or '')} | ok={result.get('ok')}"
+            f"chars={len(raw)} | ok={result.get('ok')} | "
+            f"pages={result.get('page_count')} | "
+            f"warnings={len(result.get('warnings') or [])}"
         )
+        preview = raw[:2000]
+        _safe_print(
+            "----- EXTRACT-TEXT RETURNED -----\n"
+            f"{preview}"
+            + ("\n... (truncated)" if len(raw) > 2000 else "")
+            + "\n----- END EXTRACT-TEXT -----"
+        )
+        if result.get("warnings"):
+            for warning in result["warnings"][:10]:
+                _safe_print(f"[extract-text] warning: {warning}")
         return jsonify(result)
     except ValueError as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
@@ -106,4 +119,6 @@ def _safe_print(text: str) -> None:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000") or "5000")
-    app.run(host="0.0.0.0", port=port, debug=True)
+    # Reloader kills in-flight OCR (several minutes) and the browser shows
+    # "Failed to fetch" even when PaddleOCR was still working.
+    app.run(host="0.0.0.0", port=port, debug=True, use_reloader=False)

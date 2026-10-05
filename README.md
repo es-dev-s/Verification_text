@@ -7,9 +7,9 @@ The Verification Engine API workers call this service, then Node runs Gemini par
 
 | Format | Method |
 |--------|--------|
-| PDF | Per page: native text, OCR when little/no text |
-| PNG / JPG | OCR |
-| DOCX | Paragraphs + tables; OCR embedded images if almost no text |
+| PDF | Per page: native text, Tesseract OCR when little/no text |
+| PNG / JPG | Tesseract OCR |
+| DOCX | Paragraphs + tables; Tesseract OCR on embedded images if almost no text |
 
 ## Setup
 
@@ -17,7 +17,12 @@ The Verification Engine API workers call this service, then Node runs Gemini par
 pip install -r requirements.txt
 ```
 
-Tesseract must be on `PATH` for OCR (images / scanned PDFs / DOCX images).
+OCR uses **Tesseract** via `pytesseract`. Install the Tesseract binary on the host
+(or set `TESSERACT_CMD`). Scanned PDF pages are rendered at **400 DPI grayscale**,
+word boxes are mapped back to PDF coordinates, and dual-pass PSM settings keep
+dense transcript tables readable. Optional knobs: `TESSERACT_DPI`,
+`TESSERACT_LANG`, `TESSERACT_TIMEOUT_SEC`, `TESSERACT_PREPROCESS`,
+`TESSERACT_REMOVE_GRID`.
 
 ## Run
 
@@ -50,5 +55,6 @@ Debug UI at `http://localhost:5000` exercises the same `/extract-text` endpoint.
 
 ## Production
 
-See `Dockerfile` / `docker-compose.yml`. Gunicorn timeout should cover OCR-heavy PDFs (e.g. 180s).
+See `Dockerfile` / `docker-compose.yml`. Gunicorn timeout should cover OCR-heavy PDFs
+(default 900s). Per-page Tesseract timeout defaults to 180s (`TESSERACT_TIMEOUT_SEC`).
 Gemini API keys belong in the Verification Engine `api/.env`, not here.

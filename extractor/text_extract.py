@@ -10,7 +10,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from extractor.ocr import OcrUnavailableError, ocr_page, ocr_status
+from extractor.ocr import (
+    OCR_TIMEOUT_SEC,
+    OcrUnavailableError,
+    ocr_page,
+    ocr_status,
+)
 from extractor.pdf_utils import (
     classify_page,
     extract_page_spans,
@@ -19,8 +24,6 @@ from extractor.pdf_utils import (
     reconstruct_text,
     spans_to_lines,
 )
-
-OCR_TIMEOUT_SEC = 120.0
 
 
 def extract_full_document(

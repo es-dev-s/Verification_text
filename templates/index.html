@@ -168,7 +168,16 @@
         render(data);
       } catch (err) {
         errorBox.style.display = "block";
-        errorBox.textContent = err.message;
+        const msg = err && err.message ? String(err.message) : String(err);
+        // Browser shows this when the HTTP connection drops before OCR finishes.
+        if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+          errorBox.textContent =
+            "Failed to fetch — browser lost the connection before OCR finished. " +
+            "PaddleOCR can take several minutes on CPU. Check the titlextractor " +
+            "terminal for [ocr] / [extract-text] logs (OCR may still have succeeded).";
+        } else {
+          errorBox.textContent = msg;
+        }
       } finally {
         button.disabled = false;
         button.textContent = "Extract text";
