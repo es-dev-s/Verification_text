@@ -2,3 +2,5 @@
 .env
 /uploads/testcorpus
 /uploads
+/extractor/__pycache__/
+*.pyc
