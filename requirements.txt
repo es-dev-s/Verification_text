@@ -1,9 +1,15 @@
+# Web — app.py; gunicorn via entrypoint.py / Dockerfile
 Flask==3.0.3
+gunicorn==26.2.0
+
+# PDF + images — fitz (PyMuPDF), PIL, numpy in pdf_utils.py / ocr.py
 PyMuPDF==1.24.9
 Pillow==10.4.0
+numpy>=1.24.0
+
+# OCR — paddleocr (lazy) in extractor/ocr.py; paddlepaddle is its runtime
 paddleocr==3.7.0
 paddlepaddle==3.2.2
-numpy>=1.24.0
-gunicorn==26.2.0
-waitress==3.0.2
+
+# DOCX — python-docx (lazy) in extractor/docx_extract.py
 python-docx==1.1.2
