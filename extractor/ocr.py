@@ -28,6 +28,9 @@ _COLUMN_GAP_MIN_PX = 18.0
 # Dense transcript tables need tight vertical banding so rows don't collapse.
 _LINE_Y_OVERLAP_RATIO = 0.55
 _LINE_Y_MID_RATIO = 0.35
+# Near-blank pages: skip Paddle when there is almost no ink.
+_BLANK_MAX_STD = 8.0
+_BLANK_MIN_MEAN = 245.0
 # Mobile PP-OCR models — much faster on CPU than medium/server.
 _DET_MODEL = os.environ.get("PADDLEOCR_DET_MODEL", "PP-OCRv5_mobile_det")
 _REC_MODEL = os.environ.get("PADDLEOCR_REC_MODEL", "en_PP-OCRv5_mobile_rec")
@@ -57,6 +60,12 @@ def _paddle_lang() -> str:
     return (os.environ.get("PADDLEOCR_LANG") or "en").strip() or "en"
 
 
+def _enable_mkldnn() -> bool:
+    """oneDNN is fast on CPU but can crash on some Paddle builds; opt-in via env."""
+    raw = (os.environ.get("PADDLEOCR_ENABLE_MKLDNN") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _get_engine() -> Any:
     global _OCR_ENGINE
     if _OCR_ENGINE is not None:
@@ -65,20 +74,26 @@ def _get_engine() -> Any:
         raise OcrUnavailableError(
             "OCR extras are not installed. Run: pip install paddleocr paddlepaddle"
         )
-    # PaddlePaddle 3.3.x + oneDNN can crash on CPU; disabling mkldnn is the supported workaround.
+    # PaddlePaddle 3.3.x + oneDNN can crash on CPU; default stays off.
+    # Set PADDLEOCR_ENABLE_MKLDNN=1 to try it on 3.2.x after smoke-testing.
     # Mobile det/rec + capped side length keeps CPU OCR usable for multi-page transcripts.
     _OCR_ENGINE = _PaddleOCR(
         lang=_paddle_lang(),
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False,
-        enable_mkldnn=False,
+        enable_mkldnn=_enable_mkldnn(),
         text_detection_model_name=_DET_MODEL,
         text_recognition_model_name=_REC_MODEL,
         text_det_limit_side_len=960,
         text_det_limit_type="max",
     )
     return _OCR_ENGINE
+
+
+def warm_ocr_engine() -> dict[str, Any]:
+    """Load PaddleOCR once so the first real request skips cold model init."""
+    return ocr_status()
 
 
 def ocr_is_available() -> bool:
@@ -115,7 +130,17 @@ def ocr_page(
 ) -> list[dict[str, Any]]:
     """OCR one PDF page and return native-shaped spans (one span per visual line)."""
     del timeout  # reserved for API compatibility; Paddle has no per-call timeout hook
+    prepared = prepare_ocr_page(page, page_number, dpi=dpi, band=band)
+    return ocr_prepared(prepared)
 
+
+def prepare_ocr_page(
+    page: fitz.Page,
+    page_number: int,
+    dpi: int = DEFAULT_DPI,
+    band: float = TITLE_BAND,
+) -> dict[str, Any]:
+    """Render a PDF page to RGB for OCR (safe to call off the OCR lock)."""
     rect = page.rect
     clip = fitz.Rect(
         rect.x0,
@@ -124,14 +149,23 @@ def ocr_page(
         rect.y0 + rect.height * min(max(band, 0.35), 1.0),
     )
     image_rgb, image_w, image_h = _render_page_rgb(page, clip, dpi)
-    x_scale = clip.width / max(image_w, 1)
-    y_scale = clip.height / max(image_h, 1)
+    return {
+        "image_rgb": image_rgb,
+        "page_number": page_number,
+        "clip_origin": (clip.x0, clip.y0),
+        "x_scale": clip.width / max(image_w, 1),
+        "y_scale": clip.height / max(image_h, 1),
+    }
+
+
+def ocr_prepared(prepared: dict[str, Any]) -> list[dict[str, Any]]:
+    """Run PaddleOCR on a prepare_ocr_page() result."""
     return _ocr_rgb_array(
-        image_rgb,
-        page_number=page_number,
-        clip_origin=(clip.x0, clip.y0),
-        x_scale=x_scale,
-        y_scale=y_scale,
+        prepared["image_rgb"],
+        page_number=int(prepared["page_number"]),
+        clip_origin=prepared.get("clip_origin", (0.0, 0.0)),
+        x_scale=float(prepared.get("x_scale", 1.0)),
+        y_scale=float(prepared.get("y_scale", 1.0)),
     )
 
 
@@ -171,22 +205,39 @@ def _render_page_rgb(
     clip: fitz.Rect,
     dpi: int,
 ) -> tuple[np.ndarray, int, int]:
-    scale = dpi / 72.0
+    # Keep requested DPI for recognition quality; only downscale after render.
+    scale = max(int(dpi), 72) / 72.0
     pixmap = page.get_pixmap(
         matrix=fitz.Matrix(scale, scale),
         alpha=False,
         colorspace=fitz.csRGB,
         clip=clip,
     )
-    image = Image.frombytes("RGB", (pixmap.width, pixmap.height), pixmap.samples)
-    if image.width > MAX_OCR_WIDTH:
-        ratio = MAX_OCR_WIDTH / float(image.width)
-        image = image.resize(
-            (MAX_OCR_WIDTH, max(1, int(image.height * ratio))),
-            Image.BILINEAR,
-        )
-    array = np.array(image)
-    return array, image.width, image.height
+    # Direct numpy path — skip PIL when already at/under the OCR width.
+    array = np.frombuffer(pixmap.samples, dtype=np.uint8).reshape(
+        pixmap.height, pixmap.width, 3
+    ).copy()
+    width, height = pixmap.width, pixmap.height
+    if width > MAX_OCR_WIDTH:
+        ratio = MAX_OCR_WIDTH / float(width)
+        new_h = max(1, int(height * ratio))
+        image = Image.fromarray(array)
+        image = image.resize((MAX_OCR_WIDTH, new_h), Image.BILINEAR)
+        array = np.array(image)
+        width, height = image.width, image.height
+    return array, width, height
+
+
+def _is_near_blank(image_rgb: np.ndarray) -> bool:
+    """True when the page is essentially empty (no ink worth OCR)."""
+    if image_rgb.size == 0:
+        return True
+    # Sample a coarse grid for speed on large pages.
+    sample = image_rgb[::8, ::8]
+    if sample.size == 0:
+        return True
+    gray = sample.mean(axis=2) if sample.ndim == 3 else sample.astype(np.float64)
+    return float(gray.std()) < _BLANK_MAX_STD and float(gray.mean()) > _BLANK_MIN_MEAN
 
 
 def _ocr_rgb_array(
@@ -197,6 +248,8 @@ def _ocr_rgb_array(
     x_scale: float = 1.0,
     y_scale: float = 1.0,
 ) -> list[dict[str, Any]]:
+    if _is_near_blank(image_rgb):
+        return []
     _ensure_paddle()
     with _OCR_LOCK:
         raw = list(_get_engine().predict(image_rgb))

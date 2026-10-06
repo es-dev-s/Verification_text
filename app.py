@@ -8,6 +8,7 @@ POST /extract-text  — PDF / PNG / JPG / DOCX → raw_text + method + ocr_confi
 
 import os
 import sys
+import threading
 import uuid
 from pathlib import Path
 
@@ -21,6 +22,19 @@ from flask import Flask, request, render_template, jsonify
 from extractor.extract_any import extract_text_file
 
 app = Flask(__name__)
+
+
+def _warm_ocr_in_background() -> None:
+    """Load Paddle models once per worker so the first OCR request is not cold."""
+    try:
+        from extractor.ocr import warm_ocr_engine
+
+        warm_ocr_engine()
+    except Exception:
+        pass
+
+
+threading.Thread(target=_warm_ocr_in_background, name="ocr-warmup", daemon=True).start()
 
 for _stream in (sys.stdout, sys.stderr):
     reconfigure = getattr(_stream, "reconfigure", None)

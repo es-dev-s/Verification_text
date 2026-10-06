@@ -8,9 +8,15 @@ cap and no OCR page budget.
 
 from __future__ import annotations
 
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any
 
-from extractor.ocr import OcrUnavailableError, ocr_page, ocr_status
+from extractor.ocr import (
+    OcrUnavailableError,
+    ocr_prepared,
+    ocr_status,
+    prepare_ocr_page,
+)
 from extractor.pdf_utils import (
     classify_page,
     extract_page_spans,
@@ -43,11 +49,14 @@ def extract_full_document(
         page_geom: dict[int, tuple[float, float]] = {}
         document_page_count = doc.page_count
 
+        plans = _plan_pages(doc, use_ocr, warnings)
+        page_results = _execute_plans(pdf_path, doc, plans, warnings)
+
         for page_index in range(document_page_count):
             page = doc[page_index]
             page_number = page_index + 1
             page_geom[page_number] = (float(page.rect.width), float(page.rect.height))
-            page_spans, report = _extract_one_page(page, page_number, use_ocr, warnings)
+            page_spans, report = page_results[page_index]
             spans.extend(page_spans)
             pages.append(report)
 
@@ -75,6 +84,167 @@ def extract_full_document(
         }
     finally:
         doc.close()
+
+
+def _plan_pages(
+    doc: Any,
+    use_ocr: bool,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Classify each page and decide native vs OCR without running Paddle yet."""
+    plans: list[dict[str, Any]] = []
+    for page_index in range(doc.page_count):
+        page = doc[page_index]
+        page_number = page_index + 1
+        kind = classify_page(page)
+        plan: dict[str, Any] = {
+            "page_index": page_index,
+            "page_number": page_number,
+            "kind": kind,
+            "action": "empty",
+            "spans": [],
+            "error": None,
+        }
+
+        if kind == "native":
+            plan["action"] = "native"
+            plan["spans"] = extract_page_spans(page, page_number)
+        elif kind in {"scanned", "garbled"}:
+            native_spans = extract_usable_native_spans(page, page_number)
+            if native_spans:
+                plan["action"] = "native"
+                plan["spans"] = native_spans
+            elif not use_ocr:
+                plan["action"] = "ocr_skipped"
+                plan["error"] = "OCR skipped"
+            else:
+                plan["action"] = "ocr"
+        plans.append(plan)
+    return plans
+
+
+def _render_ocr_page_from_path(
+    pdf_path: str,
+    page_index: int,
+    page_number: int,
+) -> dict[str, Any]:
+    """Render in a worker thread with its own Document (PyMuPDF is not thread-safe)."""
+    doc = open_pdf(pdf_path)
+    try:
+        return prepare_ocr_page(doc[page_index], page_number)
+    finally:
+        doc.close()
+
+
+def _execute_plans(
+    pdf_path: str,
+    doc: Any,
+    plans: list[dict[str, Any]],
+    warnings: list[str],
+) -> list[tuple[list[dict[str, Any]], dict[str, Any]]]:
+    """Run OCR with one-page render prefetch overlapping the current predict()."""
+    results: list[tuple[list[dict[str, Any]], dict[str, Any]]] = [
+        ([], {}) for _ in plans
+    ]
+    ocr_indices = [i for i, plan in enumerate(plans) if plan["action"] == "ocr"]
+
+    with ThreadPoolExecutor(max_workers=1) as render_pool:
+        prefetch: Future[dict[str, Any]] | None = None
+        prefetch_index: int | None = None
+
+        def _start_prefetch(from_pos: int) -> None:
+            nonlocal prefetch, prefetch_index
+            for pos in range(from_pos, len(ocr_indices)):
+                idx = ocr_indices[pos]
+                plan = plans[idx]
+                prefetch = render_pool.submit(
+                    _render_ocr_page_from_path,
+                    pdf_path,
+                    plan["page_index"],
+                    plan["page_number"],
+                )
+                prefetch_index = idx
+                return
+            prefetch = None
+            prefetch_index = None
+
+        if ocr_indices:
+            _start_prefetch(0)
+
+        ocr_pos = 0
+        for index, plan in enumerate(plans):
+            if plan["action"] != "ocr":
+                results[index] = _report_from_plan(plan)
+                continue
+
+            try:
+                if prefetch is not None and prefetch_index == index:
+                    prepared = prefetch.result()
+                else:
+                    prepared = prepare_ocr_page(
+                        doc[plan["page_index"]],
+                        plan["page_number"],
+                    )
+                ocr_pos += 1
+                _start_prefetch(ocr_pos)
+                page_spans = ocr_prepared(prepared)
+                plan = {
+                    **plan,
+                    "spans": page_spans,
+                    "action": "ocr",
+                    "error": None,
+                }
+            except OcrUnavailableError as exc:
+                warnings.append(f"Page {plan['page_number']}: {exc}")
+                plan = {
+                    **plan,
+                    "spans": [],
+                    "action": "ocr_unavailable",
+                    "error": str(exc),
+                }
+                ocr_pos += 1
+                _start_prefetch(ocr_pos)
+            except Exception as exc:
+                message = f"OCR failed: {exc}"
+                warnings.append(f"Page {plan['page_number']}: {message}")
+                plan = {
+                    **plan,
+                    "spans": [],
+                    "action": "ocr_failed",
+                    "error": message,
+                }
+                ocr_pos += 1
+                _start_prefetch(ocr_pos)
+
+            results[index] = _report_from_plan(plan)
+
+    return results
+
+
+def _report_from_plan(
+    plan: dict[str, Any],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    page_spans = list(plan.get("spans") or [])
+    method = str(plan.get("action") or "empty")
+    confidences = [
+        float(span["confidence"])
+        for span in page_spans
+        if span.get("source") == "ocr" and span.get("confidence") is not None
+    ]
+    ocr_confidence = (
+        round(sum(confidences) / len(confidences), 1) if confidences else None
+    )
+    report = {
+        "page": plan["page_number"],
+        "kind": plan["kind"],
+        "source": _page_source(method),
+        "method": method,
+        "ocr_confidence": ocr_confidence,
+        "span_count": len(page_spans),
+        "char_count": sum(len(span.get("text") or "") for span in page_spans),
+        "error": plan.get("error"),
+    }
+    return page_spans, report
 
 
 def _spans_to_document_lines(spans: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -110,73 +280,6 @@ def _spans_to_document_lines(spans: list[dict[str, Any]]) -> list[dict[str, Any]
             )
         return lines
     return spans_to_lines(spans)
-
-
-def _extract_one_page(
-    page: Any,
-    page_number: int,
-    use_ocr: bool,
-    warnings: list[str],
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    kind = classify_page(page)
-    method = "empty"
-    error: str | None = None
-    page_spans: list[dict[str, Any]] = []
-
-    if kind == "native":
-        page_spans = extract_page_spans(page, page_number)
-        method = "native"
-    elif kind in {"scanned", "garbled"}:
-        native_spans = extract_usable_native_spans(page, page_number)
-        if native_spans:
-            page_spans = native_spans
-            method = "native"
-        elif not use_ocr:
-            method = "ocr_skipped"
-            error = "OCR skipped"
-        else:
-            page_spans, method, error = _run_ocr(page, page_number, warnings)
-    else:
-        method = "empty"
-
-    source = _page_source(method)
-    confidences = [
-        float(span["confidence"])
-        for span in page_spans
-        if span.get("source") == "ocr" and span.get("confidence") is not None
-    ]
-    ocr_confidence = (
-        round(sum(confidences) / len(confidences), 1) if confidences else None
-    )
-
-    report = {
-        "page": page_number,
-        "kind": kind,
-        "source": source,
-        "method": method,
-        "ocr_confidence": ocr_confidence,
-        "span_count": len(page_spans),
-        "char_count": sum(len(span.get("text") or "") for span in page_spans),
-        "error": error,
-    }
-    return page_spans, report
-
-
-def _run_ocr(
-    page: Any,
-    page_number: int,
-    warnings: list[str],
-) -> tuple[list[dict[str, Any]], str, str | None]:
-    try:
-        spans = ocr_page(page, page_number, timeout=OCR_TIMEOUT_SEC)
-        return spans, "ocr", None
-    except OcrUnavailableError as exc:
-        warnings.append(f"Page {page_number}: {exc}")
-        return [], "ocr_unavailable", str(exc)
-    except Exception as exc:
-        message = f"OCR failed: {exc}"
-        warnings.append(f"Page {page_number}: {message}")
-        return [], "ocr_failed", message
 
 
 def _page_source(method: str) -> str:
