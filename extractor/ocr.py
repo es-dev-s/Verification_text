@@ -9,8 +9,12 @@ gets one field group per line instead of a single mashed paragraph.
 from __future__ import annotations
 
 import os
+import queue
+import sys
 import threading
-from typing import Any
+import time
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 import fitz
 import numpy as np
@@ -36,12 +40,37 @@ _DET_MODEL = os.environ.get("PADDLEOCR_DET_MODEL", "PP-OCRv5_mobile_det")
 _REC_MODEL = os.environ.get("PADDLEOCR_REC_MODEL", "en_PP-OCRv5_mobile_rec")
 
 _PaddleOCR: Any = None
-_OCR_ENGINE: Any = None
-_OCR_LOCK = threading.Lock()
+
+# Pool of independent PaddleOCR instances. A single instance is not thread-safe,
+# so each engine is checked out by exactly one thread at a time; different
+# engines run in parallel (pages of one document and concurrent requests).
+_POOL: "_EnginePool | None" = None
+_POOL_INIT_LOCK = threading.Lock()
+_POOL_STATE: dict[str, Any] = {"state": "idle", "reason": "not loaded yet"}
+_INIT_RETRY_COOLDOWN_SEC = 30.0
+_LAST_INIT_FAILURE: dict[str, Any] = {"at": 0.0, "error": None}
+# Set after oneDNN fails at runtime so later pool builds skip it.
+_MKLDNN_DISABLED_AT_RUNTIME = False
+# oneDNN/PIR crash on CPU: Paddle 3.3.0 and 3.3.1 (PaddlePaddle/Paddle#77340,
+# PaddleOCR#18162); 3.2.x is the newest release confirmed fine.
+_MKLDNN_BAD_SERIES = ((3, 3),)
+_ONEDNN_ERROR_MARKERS = ("onednn", "mkldnn", "convertpirattribute2runtimeattribute")
 
 
 class OcrUnavailableError(RuntimeError):
     """PaddleOCR or its dependencies are missing or failed to load."""
+
+
+def _log(message: str) -> None:
+    text = f"[ocr] {message}"
+    try:
+        print(text, flush=True)
+    except Exception:
+        try:
+            sys.stdout.write(text.encode("ascii", errors="replace").decode("ascii") + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
 
 
 def _load_bindings() -> bool:
@@ -60,39 +89,329 @@ def _paddle_lang() -> str:
     return (os.environ.get("PADDLEOCR_LANG") or "en").strip() or "en"
 
 
-def _enable_mkldnn() -> bool:
-    """oneDNN is fast on CPU but can crash on some Paddle builds; opt-in via env."""
+def _env_int(name: str) -> int | None:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        _log(f"ignoring {name}={raw!r} (not an integer)")
+        return None
+    return value if value >= 1 else None
+
+
+def _paddle_version() -> tuple[str | None, tuple[int, int] | None]:
+    """Installed paddlepaddle version without importing paddle itself."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover
+        return None, None
+    for dist in ("paddlepaddle", "paddlepaddle-gpu"):
+        try:
+            text = version(dist)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            continue
+        parts = text.split(".")
+        try:
+            return text, (int(parts[0]), int("".join(ch for ch in parts[1] if ch.isdigit()) or 0))
+        except (IndexError, ValueError):
+            return text, None
+    return None, None
+
+
+def _mkldnn_decision() -> tuple[bool, str]:
+    """
+    Decide whether to try oneDNN (MKLDNN) on CPU.
+
+    PADDLEOCR_ENABLE_MKLDNN=1/true/on forces it on, 0/false/off forces it off,
+    unset/auto enables it unless the installed Paddle is a known-bad series.
+    A failed init or warm-up always falls back to oneDNN off.
+    """
     raw = (os.environ.get("PADDLEOCR_ENABLE_MKLDNN") or "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+    if raw in {"0", "false", "no", "off"}:
+        return False, "forced off by PADDLEOCR_ENABLE_MKLDNN"
+    if _MKLDNN_DISABLED_AT_RUNTIME:
+        return False, "disabled after a oneDNN runtime failure"
+    if raw in {"1", "true", "yes", "on"}:
+        return True, "forced on by PADDLEOCR_ENABLE_MKLDNN"
+    text, series = _paddle_version()
+    if series is None:
+        return True, f"auto (paddlepaddle {text or 'unknown'}; falls back if it fails)"
+    if series in _MKLDNN_BAD_SERIES:
+        return False, f"auto off: paddlepaddle {text} has the oneDNN/PIR crash"
+    return True, f"auto on (paddlepaddle {text})"
 
 
-def _get_engine() -> Any:
-    global _OCR_ENGINE
-    if _OCR_ENGINE is not None:
-        return _OCR_ENGINE
+def _physical_cores() -> int:
+    logical = os.cpu_count() or 1
+    physical: int | None = None
+    try:
+        import psutil  # type: ignore
+
+        physical = psutil.cpu_count(logical=False)
+    except Exception:
+        physical = None
+    if not physical:
+        try:
+            pairs: set[tuple[str, str]] = set()
+            phys_id = "0"
+            with open("/proc/cpuinfo", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("physical id"):
+                        phys_id = line.split(":", 1)[1].strip()
+                    elif line.startswith("core id"):
+                        pairs.add((phys_id, line.split(":", 1)[1].strip()))
+            physical = len(pairs) or None
+        except Exception:
+            physical = None
+    cores = physical or logical
+    # Respect CPU affinity / container cpusets where the OS exposes them.
+    try:
+        allowed = len(os.sched_getaffinity(0))  # type: ignore[attr-defined]
+        cores = min(cores, allowed)
+    except Exception:
+        pass
+    return max(1, int(cores))
+
+
+def _process_count() -> int:
+    """Gunicorn runs WEB_CONCURRENCY worker processes, each with its own pool."""
+    if "gunicorn" in sys.modules:
+        return _env_int("WEB_CONCURRENCY") or 1
+    return 1
+
+
+def _pool_size() -> int:
+    configured = _env_int("PADDLEOCR_WORKERS")
+    if configured:
+        return configured
+    # Each engine holds its own copy of the models (~hundreds of MB), so stay small.
+    return max(1, min(2, _physical_cores() // 2))
+
+
+def _cpu_threads(pool_size: int) -> int:
+    configured = _env_int("PADDLEOCR_CPU_THREADS")
+    if configured:
+        return configured
+    return max(1, _physical_cores() // max(1, pool_size * _process_count()))
+
+
+def _gpu_available() -> bool:
+    try:
+        import paddle  # type: ignore
+
+        if not paddle.device.is_compiled_with_cuda():
+            return False
+        return int(paddle.device.cuda.device_count()) > 0
+    except Exception:
+        return False
+
+
+def _requested_device() -> str:
+    """PADDLEOCR_DEVICE=cpu|gpu|gpu:N|auto (auto: first GPU on a CUDA build, else CPU)."""
+    raw = (os.environ.get("PADDLEOCR_DEVICE") or "auto").strip().lower() or "auto"
+    if raw == "auto":
+        return "gpu:0" if _gpu_available() else "cpu"
+    if raw.startswith("gpu") and not _gpu_available():
+        _log(f"PADDLEOCR_DEVICE={raw} but no CUDA build/GPU is available; using cpu")
+        return "cpu"
+    return raw
+
+
+def _warmup_image() -> np.ndarray:
+    """Small synthetic page with real glyphs so both det and rec actually run."""
+    from PIL import ImageDraw, ImageFont
+
+    image = Image.new("RGB", (720, 160), (255, 255, 255))
+    draw = ImageDraw.Draw(image)
+    try:
+        font: Any = ImageFont.load_default(size=40)
+    except Exception:
+        font = ImageFont.load_default()
+    draw.text((20, 20), "University Transcript", fill=(0, 0, 0), font=font)
+    draw.text((20, 90), "CS 1010  Grade A  3.0", fill=(0, 0, 0), font=font)
+    return np.array(image)
+
+
+def _build_engine(device: str, mkldnn: bool, cpu_threads: int) -> Any:
+    # Mobile det/rec + capped side length keeps CPU OCR usable for multi-page transcripts.
+    kwargs: dict[str, Any] = {
+        "lang": _paddle_lang(),
+        "use_doc_orientation_classify": False,
+        "use_doc_unwarping": False,
+        "use_textline_orientation": False,
+        "enable_mkldnn": mkldnn,
+        "text_detection_model_name": _DET_MODEL,
+        "text_recognition_model_name": _REC_MODEL,
+        "text_det_limit_side_len": 960,
+        "text_det_limit_type": "max",
+        "device": device,
+    }
+    if device == "cpu":
+        kwargs["cpu_threads"] = cpu_threads
+    return _PaddleOCR(**kwargs)
+
+
+def _build_and_warm(device: str, mkldnn: bool, cpu_threads: int) -> Any:
+    engine = _build_engine(device, mkldnn, cpu_threads)
+    list(engine.predict(_warmup_image()))
+    return engine
+
+
+def _looks_like_onednn_error(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(marker in text for marker in _ONEDNN_ERROR_MARKERS)
+
+
+class _EnginePool:
+    def __init__(self, engines: list[Any], config: dict[str, Any]) -> None:
+        self.size = len(engines)
+        self.config = config
+        self._idle: "queue.Queue[Any]" = queue.Queue()
+        for engine in engines:
+            self._idle.put(engine)
+
+    @contextmanager
+    def engine(self) -> Iterator[Any]:
+        engine = self._idle.get()
+        try:
+            yield engine
+        finally:
+            self._idle.put(engine)
+
+
+def _create_pool() -> _EnginePool:
+    """Build N engines; the first one decides device/oneDNN via warm-up fallbacks."""
+    size = _pool_size()
+    threads = _cpu_threads(size)
+    device = _requested_device()
+    want_mkldnn, mkldnn_reason = _mkldnn_decision()
+
+    attempts: list[tuple[str, bool]] = []
+    if device != "cpu":
+        attempts.append((device, False))
+    if want_mkldnn:
+        attempts.append(("cpu", True))
+    attempts.append(("cpu", False))
+
+    started = time.perf_counter()
+    first: Any = None
+    chosen: tuple[str, bool] | None = None
+    last_exc: BaseException | None = None
+    for attempt_device, attempt_mkldnn in attempts:
+        try:
+            first = _build_and_warm(attempt_device, attempt_mkldnn, threads)
+            chosen = (attempt_device, attempt_mkldnn)
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            label = f"device={attempt_device} mkldnn={'on' if attempt_mkldnn else 'off'}"
+            _log(f"engine init/warm-up failed ({label}): {type(exc).__name__}: {exc}")
+            if attempt_mkldnn:
+                _log("falling back to oneDNN off")
+            elif attempt_device != "cpu":
+                _log("falling back to cpu")
+    if chosen is None:
+        raise OcrUnavailableError(f"PaddleOCR init failed: {last_exc}")
+
+    engines = [first]
+    for index in range(1, size):
+        try:
+            engines.append(_build_and_warm(chosen[0], chosen[1], threads))
+        except Exception as exc:  # noqa: BLE001
+            _log(
+                f"could not create OCR engine {index + 1}/{size} "
+                f"({type(exc).__name__}: {exc}); continuing with {len(engines)}"
+            )
+            break
+
+    config = {
+        "workers": len(engines),
+        "device": chosen[0],
+        "mkldnn": chosen[1],
+        "mkldnn_reason": mkldnn_reason if chosen[1] == want_mkldnn else "fell back to off",
+        "cpu_threads": threads if chosen[0] == "cpu" else None,
+        "det_model": _DET_MODEL,
+        "rec_model": _REC_MODEL,
+    }
+    _log(
+        f"pool ready in {time.perf_counter() - started:.1f}s: workers={config['workers']} "
+        f"device={config['device']} mkldnn={'on' if config['mkldnn'] else 'off'} "
+        f"({config['mkldnn_reason']}) cpu_threads={config['cpu_threads']} "
+        f"det={_DET_MODEL} rec={_REC_MODEL}"
+    )
+    return _EnginePool(engines, config)
+
+
+def _get_pool() -> _EnginePool:
+    """Return the shared pool, building it once (concurrent callers wait for it)."""
+    global _POOL
+    pool = _POOL
+    if pool is not None:
+        return pool
     if not _load_bindings():
         raise OcrUnavailableError(
             "OCR extras are not installed. Run: pip install paddleocr paddlepaddle"
         )
-    # PaddlePaddle 3.3.x + oneDNN can crash on CPU; default stays off.
-    # Set PADDLEOCR_ENABLE_MKLDNN=1 to try it on 3.2.x after smoke-testing.
-    # Mobile det/rec + capped side length keeps CPU OCR usable for multi-page transcripts.
-    _OCR_ENGINE = _PaddleOCR(
-        lang=_paddle_lang(),
-        use_doc_orientation_classify=False,
-        use_doc_unwarping=False,
-        use_textline_orientation=False,
-        enable_mkldnn=_enable_mkldnn(),
-        text_detection_model_name=_DET_MODEL,
-        text_recognition_model_name=_REC_MODEL,
-        text_det_limit_side_len=960,
-        text_det_limit_type="max",
-    )
-    return _OCR_ENGINE
+    with _POOL_INIT_LOCK:
+        if _POOL is not None:
+            return _POOL
+        since_failure = time.monotonic() - float(_LAST_INIT_FAILURE["at"] or 0.0)
+        if _LAST_INIT_FAILURE["error"] and since_failure < _INIT_RETRY_COOLDOWN_SEC:
+            # Don't hammer a broken install with a full model load on every page.
+            raise OcrUnavailableError(str(_LAST_INIT_FAILURE["error"]))
+        _POOL_STATE.update(state="loading", reason="loading models")
+        try:
+            _POOL = _create_pool()
+        except Exception as exc:  # noqa: BLE001
+            message = str(exc) if isinstance(exc, OcrUnavailableError) else f"PaddleOCR init failed: {exc}"
+            _LAST_INIT_FAILURE.update(at=time.monotonic(), error=message)
+            _POOL_STATE.update(state="failed", reason=message)
+            raise OcrUnavailableError(message) from exc
+        _LAST_INIT_FAILURE.update(at=0.0, error=None)
+        _POOL_STATE.update(state="ready", reason="ready")
+        return _POOL
+
+
+def _disable_mkldnn_and_reset(failed_pool: _EnginePool) -> None:
+    """oneDNN broke during real inference: rebuild the pool without it."""
+    global _POOL, _MKLDNN_DISABLED_AT_RUNTIME
+    with _POOL_INIT_LOCK:
+        if _POOL is failed_pool:
+            _MKLDNN_DISABLED_AT_RUNTIME = True
+            _POOL = None
+            _POOL_STATE.update(state="idle", reason="reloading without oneDNN")
+            _log("oneDNN failed during inference; rebuilding OCR pool with oneDNN off")
+
+
+def _predict(image_rgb: np.ndarray) -> list[Any]:
+    pool = _get_pool()
+    try:
+        with pool.engine() as engine:
+            return list(engine.predict(image_rgb))
+    except Exception as exc:  # noqa: BLE001
+        if not (pool.config.get("mkldnn") and _looks_like_onednn_error(exc)):
+            raise
+        _disable_mkldnn_and_reset(pool)
+    with _get_pool().engine() as engine:
+        return list(engine.predict(image_rgb))
+
+
+def ocr_pool_size() -> int:
+    """Engines in the pool (configured size until the pool is built)."""
+    pool = _POOL
+    return pool.size if pool is not None else _pool_size()
 
 
 def warm_ocr_engine() -> dict[str, Any]:
-    """Load PaddleOCR once so the first real request skips cold model init."""
+    """Build the OCR engine pool once so the first real request skips cold model init."""
+    try:
+        _get_pool()
+    except Exception:  # noqa: BLE001
+        pass
     return ocr_status()
 
 
@@ -101,24 +420,26 @@ def ocr_is_available() -> bool:
 
 
 def ocr_status() -> dict[str, Any]:
+    """Non-blocking status: never waits on model loading or running OCR."""
     if not _load_bindings():
         return {
             "available": False,
             "engine": "paddleocr",
             "reason": "paddleocr not installed in this Python",
         }
-    try:
-        with _OCR_LOCK:
-            _get_engine()
-    except OcrUnavailableError as exc:
-        return {"available": False, "engine": "paddleocr", "reason": str(exc)}
-    except Exception as exc:
-        return {
-            "available": False,
-            "engine": "paddleocr",
-            "reason": f"PaddleOCR init failed: {exc}",
-        }
-    return {"available": True, "engine": "paddleocr", "reason": "ready"}
+    state = _POOL_STATE.get("state")
+    reason = str(_POOL_STATE.get("reason") or "")
+    if state == "failed":
+        return {"available": False, "engine": "paddleocr", "reason": reason}
+    status: dict[str, Any] = {
+        "available": True,
+        "engine": "paddleocr",
+        "reason": "ready" if state == "ready" else reason,
+    }
+    pool = _POOL
+    if pool is not None:
+        status["config"] = dict(pool.config)
+    return status
 
 
 def ocr_page(
@@ -140,7 +461,7 @@ def prepare_ocr_page(
     dpi: int = DEFAULT_DPI,
     band: float = TITLE_BAND,
 ) -> dict[str, Any]:
-    """Render a PDF page to RGB for OCR (safe to call off the OCR lock)."""
+    """Render a PDF page to RGB for OCR (no OCR engine needed; thread-safe per Document)."""
     rect = page.rect
     clip = fitz.Rect(
         rect.x0,
@@ -251,8 +572,7 @@ def _ocr_rgb_array(
     if _is_near_blank(image_rgb):
         return []
     _ensure_paddle()
-    with _OCR_LOCK:
-        raw = list(_get_engine().predict(image_rgb))
+    raw = _predict(image_rgb)
     detections = _parse_paddle_results(raw)
     lines = _group_detections_into_lines(detections)
     return _lines_to_spans(
@@ -270,7 +590,7 @@ def _ensure_paddle() -> None:
             "OCR extras are not installed. Run: pip install paddleocr paddlepaddle"
         )
     try:
-        _get_engine()
+        _get_pool()
     except Exception as exc:
         raise OcrUnavailableError(f"PaddleOCR is unavailable: {exc}") from exc
 

@@ -25,7 +25,7 @@ app = Flask(__name__)
 
 
 def _warm_ocr_in_background() -> None:
-    """Load Paddle models once per worker so the first OCR request is not cold."""
+    """Load the Paddle engine pool once per worker so the first OCR request is not cold."""
     try:
         from extractor.ocr import warm_ocr_engine
 
@@ -34,7 +34,22 @@ def _warm_ocr_in_background() -> None:
         pass
 
 
-threading.Thread(target=_warm_ocr_in_background, name="ocr-warmup", daemon=True).start()
+def _should_warm_ocr_here() -> bool:
+    """
+    Skip warm-up in the Flask debug reloader's parent process.
+
+    ``python app.py`` runs with debug=True, so Werkzeug starts a watcher parent
+    that never serves requests and re-spawns a child (WERKZEUG_RUN_MAIN=true)
+    that does. Loading models in both doubled RAM and startup CPU.
+    Gunicorn workers import this module as ``app`` and always warm up.
+    """
+    if os.environ.get("WERKZEUG_RUN_MAIN") == "true":
+        return True
+    return __name__ != "__main__"
+
+
+if _should_warm_ocr_here():
+    threading.Thread(target=_warm_ocr_in_background, name="ocr-warmup", daemon=True).start()
 
 for _stream in (sys.stdout, sys.stderr):
     reconfigure = getattr(_stream, "reconfigure", None)

@@ -8,11 +8,13 @@ cap and no OCR page budget.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from extractor.ocr import (
     OcrUnavailableError,
+    ocr_pool_size,
     ocr_prepared,
     ocr_status,
     prepare_ocr_page,
@@ -27,6 +29,9 @@ from extractor.pdf_utils import (
 )
 
 OCR_TIMEOUT_SEC = 120.0
+# PyMuPDF is not thread-safe; rendering is quick, so serialize it and let the
+# (slow) PaddleOCR predict() calls run in parallel on the engine pool.
+_RENDER_LOCK = threading.Lock()
 
 
 def extract_full_document(
@@ -129,11 +134,47 @@ def _render_ocr_page_from_path(
     page_number: int,
 ) -> dict[str, Any]:
     """Render in a worker thread with its own Document (PyMuPDF is not thread-safe)."""
-    doc = open_pdf(pdf_path)
+    with _RENDER_LOCK:
+        doc = open_pdf(pdf_path)
+        try:
+            return prepare_ocr_page(doc[page_index], page_number)
+        finally:
+            doc.close()
+
+
+def _ocr_plan(
+    pdf_path: str,
+    plan: dict[str, Any],
+) -> tuple[dict[str, Any], str | None]:
+    """Render + OCR one page; returns the updated plan and an optional warning."""
     try:
-        return prepare_ocr_page(doc[page_index], page_number)
-    finally:
-        doc.close()
+        prepared = _render_ocr_page_from_path(
+            pdf_path,
+            plan["page_index"],
+            plan["page_number"],
+        )
+        page_spans = ocr_prepared(prepared)
+        return {
+            **plan,
+            "spans": page_spans,
+            "action": "ocr",
+            "error": None,
+        }, None
+    except OcrUnavailableError as exc:
+        return {
+            **plan,
+            "spans": [],
+            "action": "ocr_unavailable",
+            "error": str(exc),
+        }, f"Page {plan['page_number']}: {exc}"
+    except Exception as exc:
+        message = f"OCR failed: {exc}"
+        return {
+            **plan,
+            "spans": [],
+            "action": "ocr_failed",
+            "error": message,
+        }, f"Page {plan['page_number']}: {message}"
 
 
 def _execute_plans(
@@ -142,82 +183,41 @@ def _execute_plans(
     plans: list[dict[str, Any]],
     warnings: list[str],
 ) -> list[tuple[list[dict[str, Any]], dict[str, Any]]]:
-    """Run OCR with one-page render prefetch overlapping the current predict()."""
+    """
+    OCR pages in parallel, bounded by the OCR engine pool size.
+
+    Each worker renders its page from its own Document, so ``doc`` is not
+    touched here. Results and warnings keep page order.
+    """
+    del doc
     results: list[tuple[list[dict[str, Any]], dict[str, Any]]] = [
         ([], {}) for _ in plans
     ]
     ocr_indices = [i for i, plan in enumerate(plans) if plan["action"] == "ocr"]
-
-    with ThreadPoolExecutor(max_workers=1) as render_pool:
-        prefetch: Future[dict[str, Any]] | None = None
-        prefetch_index: int | None = None
-
-        def _start_prefetch(from_pos: int) -> None:
-            nonlocal prefetch, prefetch_index
-            for pos in range(from_pos, len(ocr_indices)):
-                idx = ocr_indices[pos]
-                plan = plans[idx]
-                prefetch = render_pool.submit(
-                    _render_ocr_page_from_path,
-                    pdf_path,
-                    plan["page_index"],
-                    plan["page_number"],
-                )
-                prefetch_index = idx
-                return
-            prefetch = None
-            prefetch_index = None
-
-        if ocr_indices:
-            _start_prefetch(0)
-
-        ocr_pos = 0
-        for index, plan in enumerate(plans):
-            if plan["action"] != "ocr":
-                results[index] = _report_from_plan(plan)
-                continue
-
-            try:
-                if prefetch is not None and prefetch_index == index:
-                    prepared = prefetch.result()
-                else:
-                    prepared = prepare_ocr_page(
-                        doc[plan["page_index"]],
-                        plan["page_number"],
-                    )
-                ocr_pos += 1
-                _start_prefetch(ocr_pos)
-                page_spans = ocr_prepared(prepared)
-                plan = {
-                    **plan,
-                    "spans": page_spans,
-                    "action": "ocr",
-                    "error": None,
-                }
-            except OcrUnavailableError as exc:
-                warnings.append(f"Page {plan['page_number']}: {exc}")
-                plan = {
-                    **plan,
-                    "spans": [],
-                    "action": "ocr_unavailable",
-                    "error": str(exc),
-                }
-                ocr_pos += 1
-                _start_prefetch(ocr_pos)
-            except Exception as exc:
-                message = f"OCR failed: {exc}"
-                warnings.append(f"Page {plan['page_number']}: {message}")
-                plan = {
-                    **plan,
-                    "spans": [],
-                    "action": "ocr_failed",
-                    "error": message,
-                }
-                ocr_pos += 1
-                _start_prefetch(ocr_pos)
-
+    for index, plan in enumerate(plans):
+        if plan["action"] != "ocr":
             results[index] = _report_from_plan(plan)
+    if not ocr_indices:
+        return results
 
+    workers = max(1, min(len(ocr_indices), ocr_pool_size()))
+    if workers == 1:
+        outcomes = [_ocr_plan(pdf_path, plans[index]) for index in ocr_indices]
+    else:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            thread_name_prefix="ocr-page",
+        ) as page_pool:
+            futures = [
+                page_pool.submit(_ocr_plan, pdf_path, plans[index])
+                for index in ocr_indices
+            ]
+            outcomes = [future.result() for future in futures]
+
+    for index, (plan, warning) in zip(ocr_indices, outcomes):
+        if warning:
+            warnings.append(warning)
+        results[index] = _report_from_plan(plan)
     return results
 
 
