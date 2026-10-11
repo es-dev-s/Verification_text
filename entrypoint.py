@@ -13,6 +13,10 @@ import sys
 port = os.environ.get("PORT", "5000").strip() or "5000"
 workers = os.environ.get("WEB_CONCURRENCY", "2").strip() or "2"
 timeout = os.environ.get("GUNICORN_TIMEOUT", "360").strip() or "360"
+gunicorn_path = os.path.join(
+    os.path.dirname(sys.executable),
+    "gunicorn",
+)
 
 # A host GUNICORN_CMD_ARGS like --bind=127.0.0.1:5000 would otherwise
 # override the config file and cause the 502 you saw in deploy logs.
@@ -24,9 +28,9 @@ print(
 )
 
 os.execvp(
-    "gunicorn",
+    gunicorn_path,
     [
-        "gunicorn",
+        gunicorn_path,
         "--bind",
         f"0.0.0.0:{port}",
         "--workers",
