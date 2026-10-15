@@ -5,11 +5,17 @@ gunicorn==26.2.0
 # PDF + images — fitz (PyMuPDF), PIL, numpy in pdf_utils.py / ocr.py
 PyMuPDF==1.24.9
 Pillow==10.4.0
-numpy>=1.24.0
+numpy==2.1.3
 
-# OCR — paddleocr (lazy) in extractor/ocr.py; paddlepaddle is its runtime
-paddleocr==3.7.0
+# OCR — paddleocr (lazy) in extractor/ocr.py; paddlepaddle (CPU) is its runtime.
+# Keep paddlepaddle on 3.2.x: 3.3.0/3.3.1 have the CPU oneDNN/PIR crash.
 paddlepaddle==3.2.2
+paddleocr==3.7.0
+paddlex==3.7.2
+# cv2 for paddlex. Must be opencv-contrib-python: paddlex checks this exact package name.
+opencv-contrib-python==4.10.0.84
+# Physical core detection for OCR thread sizing (optional import in ocr.py)
+psutil==7.2.2
 
 # DOCX — python-docx (lazy) in extractor/docx_extract.py
 python-docx==1.1.2
