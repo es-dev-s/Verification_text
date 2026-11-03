@@ -114,6 +114,20 @@ def _plan_pages(
         if kind == "native":
             plan["action"] = "native"
             plan["spans"] = extract_page_spans(page, page_number)
+        elif kind == "scanned_text_layer":
+            # A full-page scan whose only text is an embedded OCR layer: read
+            # it with our own OCR. The embedded layer is kept only as a
+            # fallback when our OCR is off, unavailable, fails or reads nothing.
+            fallback = extract_page_spans(page, page_number)
+            if use_ocr:
+                plan["action"] = "ocr"
+                plan["fallback_spans"] = fallback
+            elif fallback:
+                plan["action"] = "native"
+                plan["spans"] = fallback
+            else:
+                plan["action"] = "ocr_skipped"
+                plan["error"] = "OCR skipped"
         elif kind in {"scanned", "garbled"}:
             native_spans = extract_usable_native_spans(page, page_number)
             if native_spans:
@@ -154,6 +168,11 @@ def _ocr_plan(
             plan["page_number"],
         )
         page_spans = ocr_prepared(prepared)
+        if not page_spans and plan.get("fallback_spans"):
+            return _fallback_plan(plan, "OCR read no text"), (
+                f"Page {plan['page_number']}: OCR read no text; "
+                "kept the embedded text layer"
+            )
         return {
             **plan,
             "spans": page_spans,
@@ -161,6 +180,10 @@ def _ocr_plan(
             "error": None,
         }, None
     except OcrUnavailableError as exc:
+        if plan.get("fallback_spans"):
+            return _fallback_plan(plan, str(exc)), (
+                f"Page {plan['page_number']}: {exc}; kept the embedded text layer"
+            )
         return {
             **plan,
             "spans": [],
@@ -169,12 +192,26 @@ def _ocr_plan(
         }, f"Page {plan['page_number']}: {exc}"
     except Exception as exc:
         message = f"OCR failed: {exc}"
+        if plan.get("fallback_spans"):
+            return _fallback_plan(plan, message), (
+                f"Page {plan['page_number']}: {message}; kept the embedded text layer"
+            )
         return {
             **plan,
             "spans": [],
             "action": "ocr_failed",
             "error": message,
         }, f"Page {plan['page_number']}: {message}"
+
+
+def _fallback_plan(plan: dict[str, Any], reason: str) -> dict[str, Any]:
+    """Use a scanned page's embedded text layer when our OCR could not read it."""
+    return {
+        **plan,
+        "spans": list(plan.get("fallback_spans") or []),
+        "action": "native",
+        "error": f"embedded text layer used: {reason}",
+    }
 
 
 def _execute_plans(
@@ -298,6 +335,6 @@ def _document_type(pages: list[dict[str, Any]]) -> str:
         return "empty"
     if kinds == {"native"}:
         return "native"
-    if kinds <= {"scanned", "garbled"}:
+    if kinds <= {"scanned", "scanned_text_layer", "garbled"}:
         return "scanned"
     return "mixed"
