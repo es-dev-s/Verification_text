@@ -18,6 +18,18 @@ import fitz
 # page number or running header buried in the image).
 MIN_NATIVE_CHARS = 40
 
+# Scanned page with an embedded OCR text layer (scanner / Acrobat "searchable
+# image" PDFs). That layer is often poor OCR, so the page is read with our own
+# OCR instead. Both conditions must hold:
+#  - one image (or image mask) covers at least this share of the page area;
+SCAN_IMAGE_MIN_COVERAGE = 0.85
+#  - at least this share of the page's text characters is hidden: invisible
+#    (render mode 3), fully transparent, or drawn before (under) that image.
+SCAN_HIDDEN_TEXT_MIN_RATIO = 0.90
+# Text render mode 3 = neither fill nor stroke (invisible OCR layer).
+_INVISIBLE_RENDER_MODE = 3
+_IMAGE_BBOX_TYPES = ("fill-image", "fill-imgmask")
+
 _CID_RE = re.compile(r"\(cid:\d+\)", re.IGNORECASE)
 _BOLD_HINTS = ("bold", "black", "heavy", "demibold", "semibold", "extrabold")
 _ITALIC_HINTS = ("italic", "oblique")
@@ -43,16 +55,21 @@ def has_text_layer(pdf_path: str, max_pages: int | None = 3) -> bool:
 
 def classify_page(page: fitz.Page) -> str:
     """
-    Return one of: "native", "scanned", "garbled", "empty".
+    Return one of: "native", "scanned", "scanned_text_layer", "garbled", "empty".
 
     Native academic PDFs (IJMET-style) almost always have a real text
     layer, so OCR is skipped unless get_text() is empty or unreadable.
+    "scanned_text_layer" is a full-page scan whose only text is a hidden
+    OCR layer (see scanned_text_layer_info); that layer is not trusted.
     """
     raw = page.get_text("text") or ""
     stripped = raw.strip()
 
     if not stripped:
         return "scanned" if _page_has_images(page) else "empty"
+
+    if scanned_text_layer_info(page)["is_scan"]:
+        return "scanned_text_layer"
 
     if _looks_garbled(stripped):
         return "garbled"
@@ -63,6 +80,68 @@ def classify_page(page: fitz.Page) -> str:
         return "scanned"
 
     return "native"
+
+
+def scanned_text_layer_info(page: fitz.Page) -> dict[str, Any]:
+    """
+    Measure whether a page is one scanned image with a hidden text layer.
+
+    ``image_coverage`` is the largest share of the page covered by one image.
+    ``hidden_ratio`` is the share of text characters that cannot be seen:
+    render mode 3, opacity 0, or drawn before the covering image (under it).
+    A digital page with a logo or a full-page background drawn first keeps
+    visible text on top, so it stays native. Any read error → not a scan.
+    """
+    info: dict[str, Any] = {
+        "is_scan": False,
+        "image_coverage": 0.0,
+        "hidden_ratio": 0.0,
+        "text_chars": 0,
+    }
+    try:
+        page_rect = page.rect
+        page_area = abs(page_rect)
+        if page_area <= 0:
+            return info
+        covered = False
+        # Last opaque full-page image drawn; text drawn before it is under it.
+        # Image masks are stencils (see-through), so they hide nothing.
+        under_seq = -1
+        best = 0.0
+        for seq, (kind, bbox) in enumerate(page.get_bboxlog()):
+            if kind not in _IMAGE_BBOX_TYPES:
+                continue
+            coverage = abs(fitz.Rect(bbox) & page_rect) / page_area
+            best = max(best, coverage)
+            if coverage >= SCAN_IMAGE_MIN_COVERAGE:
+                covered = True
+                if kind == "fill-image":
+                    under_seq = seq
+        info["image_coverage"] = round(best, 3)
+        if not covered:
+            return info
+
+        total = 0
+        hidden = 0
+        for span in page.get_texttrace():
+            chars = len(span.get("chars") or ())
+            if not chars:
+                continue
+            total += chars
+            if (
+                span.get("type") == _INVISIBLE_RENDER_MODE
+                or float(span.get("opacity", 1.0) or 0.0) <= 0.0
+                or int(span.get("seqno", -1)) < under_seq
+            ):
+                hidden += chars
+        info["text_chars"] = total
+        if total == 0:
+            return info
+        info["hidden_ratio"] = round(hidden / total, 3)
+        info["is_scan"] = hidden / total >= SCAN_HIDDEN_TEXT_MIN_RATIO
+    except Exception:
+        info["is_scan"] = False
+    return info
 
 
 def extract_spans(pdf_path: str, max_pages: int | None = None) -> list[dict[str, Any]]:
